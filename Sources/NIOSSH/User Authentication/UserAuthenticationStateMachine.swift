@@ -19,7 +19,7 @@ struct UserAuthenticationStateMachine {
     private var delegate: UserAuthDelegate
     private let loop: EventLoop
     private var sessionID: ByteBuffer
-    private let role: SSHConnectionRole
+    private var keyboardInteractiveDelegate: NIOSSHKeyboardInteractiveDelegate?
 
     // TODO: The server SHOULD limit the number of authentication attempts the client may make.
     init(role: SSHConnectionRole, loop: EventLoop, sessionID: ByteBuffer) {
@@ -27,12 +27,20 @@ struct UserAuthenticationStateMachine {
         self.delegate = UserAuthDelegate(role: role)
         self.loop = loop
         self.sessionID = sessionID
-        self.role = role
+        self.keyboardInteractiveDelegate = nil
     }
 
     fileprivate static let serviceName: String = "ssh-userauth"
 
     fileprivate static let nextServiceName: String = "ssh-connection"
+
+    /// Whether the state machine is expecting a keyboard-interactive challenge.
+    internal var isExpectingKeyboardInteractive: Bool {
+        if case .awaitingKeyboardInteractiveChallenge = state {
+            return true
+        }
+        return false
+    }
 }
 
 private extension UserAuthenticationStateMachine {
@@ -42,6 +50,8 @@ private extension UserAuthenticationStateMachine {
         case awaitingServiceAcceptance
         case awaitingNextRequest
         case awaitingResponses(Int)
+        /// Waiting for keyboard-interactive challenge (info request) from the server
+        case awaitingKeyboardInteractiveChallenge(Int)
         case authenticationSucceeded
         case authenticationFailed
     }
@@ -173,6 +183,13 @@ extension UserAuthenticationStateMachine {
             // Ok, the server didn't like that much. Let's try another one.
             self.state = .awaitingNextRequest
             precondition(responseCount == 1, "We don't support parallel authentication attempts yet!")
+            self.keyboardInteractiveDelegate = nil
+            return self.requestNextAuthRequest(methods: .init(message), delegate: delegate)
+        case (.client(let delegate), .awaitingKeyboardInteractiveChallenge(let responseCount)):
+            // Keyboard-interactive auth failed. Try next method.
+            self.state = .awaitingNextRequest
+            precondition(responseCount == 1, "We don't support parallel authentication attempts yet!")
+            self.keyboardInteractiveDelegate = nil
             return self.requestNextAuthRequest(methods: .init(message), delegate: delegate)
         case (.client, .authenticationSucceeded):
             // We should ignore all further auth messages in this state.
@@ -186,6 +203,56 @@ extension UserAuthenticationStateMachine {
         case (.server, _):
             // Servers may never receive user auth failure messages.
             throw NIOSSHError.protocolViolation(protocolName: Self.protocolName, violation: "client sent user auth failure")
+        }
+    }
+
+    /// Handle a keyboard-interactive info request from the server.
+    /// Returns the info response to send, or fails if the delegate provides no response.
+    mutating func receiveUserAuthInfoRequest(_ message: SSHMessage.UserAuthInfoRequestMessage) throws -> EventLoopFuture<SSHMessage.UserAuthInfoResponseMessage>? {
+        switch (self.delegate, self.state) {
+        case (.client, .awaitingKeyboardInteractiveChallenge(let responseCount)):
+            guard let kiDelegate = self.keyboardInteractiveDelegate else {
+                throw NIOSSHError.protocolViolation(protocolName: Self.protocolName, violation: "no keyboard-interactive delegate")
+            }
+
+            let prompts = message.prompts.map { NIOSSHKeyboardInteractivePrompt(prompt: $0.prompt, echo: $0.echo) }
+            let responses = kiDelegate.respondToKeyboardInteractiveChallenge(
+                name: message.name,
+                instruction: message.instruction,
+                prompts: prompts
+            )
+
+            return self.loop.makeSucceededFuture(.init(responses: responses))
+        case (.client, .authenticationSucceeded):
+            return nil
+        case (.client, .idle), (.client, .awaitingServiceAcceptance):
+            throw NIOSSHError.protocolViolation(protocolName: Self.protocolName, violation: "server sent keyboard-interactive request unprompted")
+        case (.client, .awaitingNextRequest), (.client, .awaitingResponses), (.client, .authenticationFailed):
+            throw NIOSSHError.protocolViolation(protocolName: Self.protocolName, violation: "unexpected keyboard-interactive request")
+        case (.server, _):
+            throw NIOSSHError.protocolViolation(protocolName: Self.protocolName, violation: "client sent keyboard-interactive request")
+        }
+    }
+
+    /// Called when we've sent a keyboard-interactive info response and are waiting for a result.
+    mutating func sentUserAuthInfoResponse() {
+        switch (self.delegate, self.state) {
+        case (.client, .awaitingKeyboardInteractiveChallenge):
+            // Stay in this state - server may send more prompts or success/failure
+            break
+        default:
+            preconditionFailure("Sent keyboard-interactive response in unexpected state: \(self.state)")
+        }
+    }
+
+    /// Called when keyboard-interactive authentication succeeds.
+    mutating func keyboardInteractiveSucceeded() {
+        switch (self.delegate, self.state) {
+        case (.client, .awaitingKeyboardInteractiveChallenge):
+            self.state = .authenticationSucceeded
+            self.keyboardInteractiveDelegate = nil
+        default:
+            break
         }
     }
 
@@ -241,10 +308,14 @@ extension UserAuthenticationStateMachine {
         }
     }
 
-    mutating func sendUserAuthRequest(_: SSHMessage.UserAuthRequestMessage) {
+    mutating func sendUserAuthRequest(_ message: SSHMessage.UserAuthRequestMessage) {
         switch (self.delegate, self.state) {
         case (.client, .awaitingNextRequest):
-            self.state = .awaitingResponses(1)
+            if case .keyboardInteractive = message.method {
+                self.state = .awaitingKeyboardInteractiveChallenge(1)
+            } else {
+                self.state = .awaitingResponses(1)
+            }
         case (.client, .idle),
              (.client, .awaitingServiceAcceptance):
             preconditionFailure("Sent an auth request without asking us first")
@@ -380,13 +451,20 @@ extension UserAuthenticationStateMachine {
 // MARK: Interacting with client delegate
 
 private extension UserAuthenticationStateMachine {
-    func requestNextAuthRequest(methods: NIOSSHAvailableUserAuthenticationMethods, delegate: NIOSSHClientUserAuthenticationDelegate) -> EventLoopFuture<SSHMessage.UserAuthRequestMessage?> {
+    mutating func requestNextAuthRequest(methods: NIOSSHAvailableUserAuthenticationMethods, delegate: NIOSSHClientUserAuthenticationDelegate) -> EventLoopFuture<SSHMessage.UserAuthRequestMessage?> {
         let promise = self.loop.makePromise(of: NIOSSHUserAuthenticationOffer?.self)
         delegate.nextAuthenticationType(availableMethods: methods, nextChallengePromise: promise)
 
         // The explicit capture list is here to force a copy of the buffer, rather than capturing self.
         return promise.futureResult.flatMapThrowing { [sessionID = self.sessionID] request in
-            try request.map { try SSHMessage.UserAuthRequestMessage(request: $0, sessionID: sessionID) }
+            guard let request = request else { return nil }
+
+            // Extract keyboard-interactive delegate from offer if present
+            if case .keyboardInteractive(let kiOffer) = request.offer {
+                self.keyboardInteractiveDelegate = kiOffer.delegate
+            }
+
+            return try SSHMessage.UserAuthRequestMessage(request: request, sessionID: sessionID)
         }
     }
 }
@@ -416,34 +494,8 @@ private extension UserAuthenticationStateMachine {
                 return self.loop.makeSucceededFuture(.failure(.init(authentications: supportedMethods.strings, partialSuccess: false)))
             }
 
-            // Check if this is a certificate and validate it
-            var validatedCertificate: NIOSSHCertifiedPublicKey? = nil
-            if let certifiedKey = NIOSSHCertifiedPublicKey(key),
-               case .server(let config) = self.role,
-               !config.trustedUserCAKeys.isEmpty {
-                // This is a certificate and we have trusted CAs configured
-                do {
-                    let criticalOptions = try certifiedKey.validate(
-                        principal: request.username,
-                        type: .user,
-                        allowedAuthoritySigningKeys: config.trustedUserCAKeys,
-                        acceptableCriticalOptions: config.acceptableCriticalOptions
-                    )
-                    
-                    // Certificate is valid, store it to pass to the delegate
-                    validatedCertificate = certifiedKey
-                } catch {
-                    // Certificate validation failed
-                    return self.loop.makeSucceededFuture(.failure(.init(authentications: supportedMethods.strings, partialSuccess: false)))
-                }
-            }
-
             // Signature is valid, ask if the delegate is happy.
-            let request = NIOSSHUserAuthenticationRequest(
-                username: request.username,
-                serviceName: request.service,
-                request: .publicKey(.init(publicKey: key, certifiedKey: validatedCertificate))
-            )
+            let request = NIOSSHUserAuthenticationRequest(username: request.username, serviceName: request.service, request: .publicKey(.init(publicKey: key)))
             let promise = self.loop.makePromise(of: NIOSSHUserAuthenticationOutcome.self)
             delegate.requestReceived(request: request, responsePromise: promise)
 
@@ -453,26 +505,7 @@ private extension UserAuthenticationStateMachine {
 
         case .publicKey(.known(key: let key, signature: .none)):
             // This is a weird wrinkle in public key auth: it's a request to ask whether a given key is valid, but not to validate that key itself.
-            // For certificates, we should validate them before saying they're OK
-            if let certifiedKey = NIOSSHCertifiedPublicKey(key),
-               case .server(let config) = self.role,
-               !config.trustedUserCAKeys.isEmpty {
-                // This is a certificate and we have trusted CAs configured
-                do {
-                    _ = try certifiedKey.validate(
-                        principal: request.username,
-                        type: .user,
-                        allowedAuthoritySigningKeys: config.trustedUserCAKeys,
-                        acceptableCriticalOptions: config.acceptableCriticalOptions
-                    )
-                    // Certificate is valid
-                    return self.loop.makeSucceededFuture(.publicKeyOK(.init(key: key)))
-                } catch {
-                    // Certificate validation failed, reject it
-                    return self.loop.makeSucceededFuture(.failure(.init(authentications: delegate.supportedAuthenticationMethods.strings, partialSuccess: false)))
-                }
-            }
-            // For now we do a shortcut: we just say that all non-certificate keys are acceptable, rather than ask the delegate.
+            // For now we do a shortcut: we just say that all keys are acceptable, rather than ask the delegate.
             return self.loop.makeSucceededFuture(.publicKeyOK(.init(key: key)))
 
         case .publicKey(.unknown):

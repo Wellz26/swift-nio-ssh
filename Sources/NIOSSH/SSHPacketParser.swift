@@ -62,7 +62,7 @@ struct SSHPacketParser {
         }
     }
 
-    mutating func nextPacket() throws -> SSHMessage? {
+    mutating func nextPacket(expectingKeyboardInteractive: Bool = false) throws -> SSHMessage? {
         // This parser has a slightly strange strategy: we leave the packet length field in the buffer until we're done.
         // This is necessary because some transport protection schemes need the length field for MACing purposes, and can
         // benefit from us maintaining the state instead of having to do it themselves.
@@ -83,7 +83,7 @@ struct SSHPacketParser {
                     throw NIOSSHError.invalidEncryptedPacketLength
                 }
 
-                if let message = try self.parsePlaintext(length: length) {
+                if let message = try self.parsePlaintext(length: length, expectingKeyboardInteractive: expectingKeyboardInteractive) {
                     self.state = .cleartextWaitingForLength
                     self.sequenceNumber = self.sequenceNumber &+ 1
                     return message
@@ -93,7 +93,7 @@ struct SSHPacketParser {
             }
             return nil
         case .cleartextWaitingForBytes(let length):
-            if let message = try self.parsePlaintext(length: length) {
+            if let message = try self.parsePlaintext(length: length, expectingKeyboardInteractive: expectingKeyboardInteractive) {
                 self.state = .cleartextWaitingForLength
                 self.sequenceNumber = self.sequenceNumber &+ 1
                 return message
@@ -104,7 +104,7 @@ struct SSHPacketParser {
                 return nil
             }
 
-            if let message = try self.parseCiphertext(length: length, protection: protection) {
+            if let message = try self.parseCiphertext(length: length, protection: protection, expectingKeyboardInteractive: expectingKeyboardInteractive) {
                 self.state = .encryptedWaitingForLength(protection)
                 self.sequenceNumber = self.sequenceNumber &+ 1
                 return message
@@ -112,7 +112,7 @@ struct SSHPacketParser {
             self.state = .encryptedWaitingForBytes(length, protection)
             return nil
         case .encryptedWaitingForBytes(let length, let protection):
-            if let message = try self.parseCiphertext(length: length, protection: protection) {
+            if let message = try self.parseCiphertext(length: length, protection: protection, expectingKeyboardInteractive: expectingKeyboardInteractive) {
                 self.state = .encryptedWaitingForLength(protection)
                 self.sequenceNumber = self.sequenceNumber &+ 1
                 return message
@@ -188,7 +188,7 @@ struct SSHPacketParser {
         return decryptedLength
     }
 
-    private mutating func parsePlaintext(length: UInt32) throws -> SSHMessage? {
+    private mutating func parsePlaintext(length: UInt32, expectingKeyboardInteractive: Bool = false) throws -> SSHMessage? {
         try self.buffer.rewindReaderOnError { buffer in
             guard var buffer = buffer.readSlice(length: Int(length) + MemoryLayout<UInt32>.size) else {
                 return nil
@@ -198,7 +198,7 @@ struct SSHPacketParser {
             buffer.moveReaderIndex(forwardBy: MemoryLayout<UInt32>.size)
 
             var content = try buffer.sliceContentFromPadding()
-            guard let message = try content.readSSHMessage(), content.readableBytes == 0, buffer.readableBytes == 0 else {
+            guard let message = try content.readSSHMessage(expectingKeyboardInteractive: expectingKeyboardInteractive), content.readableBytes == 0, buffer.readableBytes == 0 else {
                 // Throw this error if the content wasn't exactly the right length for the message.
                 throw NIOSSHError.invalidPacketFormat
             }
@@ -207,14 +207,14 @@ struct SSHPacketParser {
         }
     }
 
-    private mutating func parseCiphertext(length: UInt32, protection: NIOSSHTransportProtection) throws -> SSHMessage? {
+    private mutating func parseCiphertext(length: UInt32, protection: NIOSSHTransportProtection, expectingKeyboardInteractive: Bool = false) throws -> SSHMessage? {
         try self.buffer.rewindReaderOnError { buffer in
             guard var buffer = buffer.readSlice(length: Int(length) + MemoryLayout<UInt32>.size) else {
                 return nil
             }
 
             var content = try protection.decryptAndVerifyRemainingPacket(&buffer, sequenceNumber: sequenceNumber)
-            guard let message = try content.readSSHMessage(), content.readableBytes == 0, buffer.readableBytes == 0 else {
+            guard let message = try content.readSSHMessage(expectingKeyboardInteractive: expectingKeyboardInteractive), content.readableBytes == 0, buffer.readableBytes == 0 else {
                 // Throw this error if the content wasn't exactly the right length for the message.
                 throw NIOSSHError.invalidPacketFormat
             }

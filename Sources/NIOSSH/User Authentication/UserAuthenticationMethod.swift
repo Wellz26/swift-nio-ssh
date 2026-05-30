@@ -14,10 +14,6 @@
 import NIOCore
 
 /// The user authentication modes available at this point in time.
-///
-/// Note: SSH certificate authentication is supported through the publicKey method,
-/// not as a separate authentication method. When using certificates, the publicKey
-/// method is used with a certified key.
 public struct NIOSSHAvailableUserAuthenticationMethods: OptionSet {
     public var rawValue: UInt8
 
@@ -28,8 +24,9 @@ public struct NIOSSHAvailableUserAuthenticationMethods: OptionSet {
     public static let publicKey: NIOSSHAvailableUserAuthenticationMethods = .init(rawValue: 1 << 0)
     public static let password: NIOSSHAvailableUserAuthenticationMethods = .init(rawValue: 1 << 1)
     public static let hostBased: NIOSSHAvailableUserAuthenticationMethods = .init(rawValue: 1 << 2)
+    public static let keyboardInteractive: NIOSSHAvailableUserAuthenticationMethods = .init(rawValue: 1 << 3)
 
-    public static let all: NIOSSHAvailableUserAuthenticationMethods = [.publicKey, .password, .hostBased]
+    public static let all: NIOSSHAvailableUserAuthenticationMethods = [.publicKey, .password, .hostBased, .keyboardInteractive]
 }
 
 extension NIOSSHAvailableUserAuthenticationMethods {
@@ -44,6 +41,8 @@ extension NIOSSHAvailableUserAuthenticationMethods {
                 self.insert(.password)
             case "hostbased":
                 self.insert(.hostBased)
+            case "keyboard-interactive":
+                self.insert(.keyboardInteractive)
             default:
                 // This is an unknown method, which we ignore.
                 break
@@ -58,7 +57,7 @@ extension NIOSSHAvailableUserAuthenticationMethods {
 
         // We need an array.
         var methods = [Substring]()
-        methods.reserveCapacity(3)
+        methods.reserveCapacity(4)
 
         if self.contains(.password) {
             methods.append("password")
@@ -68,6 +67,9 @@ extension NIOSSHAvailableUserAuthenticationMethods {
         }
         if self.contains(.hostBased) {
             methods.append("hostbased")
+        }
+        if self.contains(.keyboardInteractive) {
+            methods.append("keyboard-interactive")
         }
 
         return methods
@@ -101,21 +103,9 @@ public extension NIOSSHUserAuthenticationRequest {
 public extension NIOSSHUserAuthenticationRequest.Request {
     struct PublicKey {
         public var publicKey: NIOSSHPublicKey
-        
-        /// If the public key is a certificate, this contains the parsed certificate information.
-        /// This includes critical options, extensions, and other certificate metadata.
-        /// Certificate authentication in SSH uses the publicKey authentication method with
-        /// a certified key, not a separate authentication method.
-        public var certifiedKey: NIOSSHCertifiedPublicKey?
 
         public init(publicKey: NIOSSHPublicKey) {
             self.publicKey = publicKey
-            self.certifiedKey = NIOSSHCertifiedPublicKey(publicKey)
-        }
-        
-        public init(publicKey: NIOSSHPublicKey, certifiedKey: NIOSSHCertifiedPublicKey?) {
-            self.publicKey = publicKey
-            self.certifiedKey = certifiedKey
         }
     }
 
@@ -129,7 +119,7 @@ public extension NIOSSHUserAuthenticationRequest.Request {
 
     struct HostBased {
         init() {
-            fatalError("HostBased authentication is currently unimplemented")
+            fatalError("PublicKeyRequest is currently unimplemented")
         }
     }
 }
@@ -162,6 +152,7 @@ public extension NIOSSHUserAuthenticationOffer {
         case privateKey(PrivateKey)
         case password(Password)
         case hostBased(HostBased)
+        case keyboardInteractive(KeyboardInteractive)
         case none
     }
 }
@@ -176,8 +167,6 @@ public extension NIOSSHUserAuthenticationOffer.Offer {
             self.publicKey = privateKey.publicKey
         }
 
-        /// Creates a private key offer with a certified public key.
-        /// Certificate authentication uses the publicKey authentication method.
         public init(privateKey: NIOSSHPrivateKey, certifiedKey: NIOSSHCertifiedPublicKey) {
             self.privateKey = privateKey
             self.publicKey = NIOSSHPublicKey(certifiedKey)
@@ -194,7 +183,17 @@ public extension NIOSSHUserAuthenticationOffer.Offer {
 
     struct HostBased {
         init() {
-            fatalError("HostBased authentication is currently unimplemented")
+            fatalError("PublicKeyRequest is currently unimplemented")
+        }
+    }
+
+    /// Keyboard-interactive authentication offer.
+    /// Provides a delegate that responds to server prompts (typically with a password).
+    struct KeyboardInteractive {
+        public var delegate: NIOSSHKeyboardInteractiveDelegate
+
+        public init(delegate: NIOSSHKeyboardInteractiveDelegate) {
+            self.delegate = delegate
         }
     }
 }
@@ -217,6 +216,8 @@ extension SSHMessage.UserAuthRequestMessage {
             self.method = .publicKey(.known(key: privateKeyRequest.publicKey, signature: signature))
         case .password(let passwordRequest):
             self.method = .password(passwordRequest.password)
+        case .keyboardInteractive:
+            self.method = .keyboardInteractive
         case .hostBased:
             fatalError("Unsupported")
         case .none:

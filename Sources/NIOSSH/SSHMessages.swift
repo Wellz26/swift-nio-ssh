@@ -38,6 +38,8 @@ enum SSHMessage: Equatable {
     case userAuthSuccess
     case userAuthBanner(UserAuthBannerMessage)
     case userAuthPKOK(UserAuthPKOKMessage)
+    case userAuthInfoRequest(UserAuthInfoRequestMessage)
+    case userAuthInfoResponse(UserAuthInfoResponseMessage)
     case globalRequest(GlobalRequestMessage)
     case requestSuccess(RequestSuccessMessage)
     case requestFailure
@@ -146,6 +148,7 @@ extension SSHMessage {
             case none
             case publicKey(PublicKeyAuthType)
             case password(String)
+            case keyboardInteractive
         }
 
         enum PublicKeyAuthType: Equatable {
@@ -186,6 +189,30 @@ extension SSHMessage {
         static let id: UInt8 = 60
 
         var key: NIOSSHPublicKey
+    }
+
+    /// SSH_MSG_USERAUTH_INFO_REQUEST (RFC 4256).
+    /// Note: message ID 60 is context-dependent — it means PK_OK after a publickey request,
+    /// and INFO_REQUEST after a keyboard-interactive request.
+    struct UserAuthInfoRequestMessage: Equatable {
+        static let id: UInt8 = 60
+
+        var name: String
+        var instruction: String
+        var languageTag: String
+        var prompts: [Prompt]
+
+        struct Prompt: Equatable {
+            var prompt: String
+            var echo: Bool
+        }
+    }
+
+    /// SSH_MSG_USERAUTH_INFO_RESPONSE (RFC 4256).
+    struct UserAuthInfoResponseMessage: Equatable {
+        static let id: UInt8 = 61
+
+        var responses: [String]
     }
 
     struct GlobalRequestMessage: Equatable {
@@ -361,11 +388,19 @@ extension SSHMessage {
 // MARK: - Read Methods
 
 extension ByteBuffer {
-    /// Read an SSHMessage from a ByteBuffer.
+    /// Read an SSHMessage from a ByteBuffer, with optional keyboard-interactive context.
     ///
-    /// This function will consume as many bytes as the message should require. If it cannot read enough bytes,
-    /// it will return nil.
-    mutating func readSSHMessage() throws -> SSHMessage? {
+    /// When `expectingKeyboardInteractive` is true, message ID 60 is parsed as
+    /// `UserAuthInfoRequestMessage` instead of `UserAuthPKOKMessage`.
+    mutating func readSSHMessage(expectingKeyboardInteractive: Bool = false) throws -> SSHMessage? {
+        if expectingKeyboardInteractive {
+            return try self.readSSHMessageExpectingKeyboardInteractive()
+        }
+        return try self.readSSHMessageStandard()
+    }
+
+    /// Read an SSHMessage from a ByteBuffer using standard message type mapping.
+    private mutating func readSSHMessageStandard() throws -> SSHMessage? {
         try self.rewindOnNilOrError { `self` in
             guard let type = self.readInteger(as: UInt8.self) else {
                 return nil
@@ -507,6 +542,108 @@ extension ByteBuffer {
                 guard let message = self.readChannelFailureMessage() else {
                     return nil
                 }
+                return .channelFailure(message)
+            default:
+                throw SSHMessage.ParsingError.unknownType(type)
+            }
+        }
+    }
+
+    /// Read an SSHMessage treating message ID 60 as UserAuthInfoRequest (keyboard-interactive mode).
+    private mutating func readSSHMessageExpectingKeyboardInteractive() throws -> SSHMessage? {
+        try self.rewindOnNilOrError { `self` in
+            guard let type = self.readInteger(as: UInt8.self) else {
+                return nil
+            }
+
+            switch type {
+            case SSHMessage.DisconnectMessage.id:
+                guard let message = self.readDisconnectMessage() else { return nil }
+                return .disconnect(message)
+            case SSHMessage.IgnoreMessage.id:
+                guard let message = self.readIgnoreMessage() else { return nil }
+                return .ignore(message)
+            case SSHMessage.UnimplementedMessage.id:
+                guard let message = self.readUnimplementedMessage() else { return nil }
+                return .unimplemented(message)
+            case SSHMessage.DebugMessage.id:
+                guard let message = self.readDebugMessage() else { return nil }
+                return .debug(message)
+            case SSHMessage.ServiceRequestMessage.id:
+                guard let message = self.readServiceRequestMessage() else { return nil }
+                return .serviceRequest(message)
+            case SSHMessage.ServiceAcceptMessage.id:
+                guard let message = self.readServiceAcceptMessage() else { return nil }
+                return .serviceAccept(message)
+            case SSHMessage.KeyExchangeMessage.id:
+                guard let message = self.readKeyExchangeMessage() else { return nil }
+                return .keyExchange(message)
+            case SSHMessage.KeyExchangeECDHInitMessage.id:
+                guard let message = self.readKeyExchangeECDHInitMessage() else { return nil }
+                return .keyExchangeInit(message)
+            case SSHMessage.KeyExchangeECDHReplyMessage.id:
+                guard let message = try self.readKeyExchangeECDHReplyMessage() else { return nil }
+                return .keyExchangeReply(message)
+            case SSHMessage.NewKeysMessage.id:
+                return .newKeys
+            case SSHMessage.UserAuthRequestMessage.id:
+                guard let message = try self.readUserAuthRequestMessage() else { return nil }
+                return .userAuthRequest(message)
+            case SSHMessage.UserAuthFailureMessage.id:
+                guard let message = self.readUserAuthFailureMessage() else { return nil }
+                return .userAuthFailure(message)
+            case SSHMessage.UserAuthSuccessMessage.id:
+                return .userAuthSuccess
+            case SSHMessage.UserAuthBannerMessage.id:
+                guard let message = self.readUserAuthBannerMessage() else { return nil }
+                return .userAuthBanner(message)
+            case SSHMessage.UserAuthInfoRequestMessage.id:
+                // Message 60 in keyboard-interactive context means INFO_REQUEST
+                guard let message = try self.readUserAuthInfoRequestMessage() else { return nil }
+                return .userAuthInfoRequest(message)
+            case SSHMessage.UserAuthInfoResponseMessage.id:
+                guard let message = self.readUserAuthInfoResponseMessage() else { return nil }
+                return .userAuthInfoResponse(message)
+            case SSHMessage.GlobalRequestMessage.id:
+                guard let message = try self.readGlobalRequestMessage() else { return nil }
+                return .globalRequest(message)
+            case SSHMessage.RequestSuccessMessage.id:
+                guard let message = self.readRequestSuccessMessage() else { return nil }
+                return .requestSuccess(message)
+            case SSHMessage.RequestFailureMessage.id:
+                return .requestFailure
+            case SSHMessage.ChannelOpenMessage.id:
+                guard let message = try self.readChannelOpenMessage() else { return nil }
+                return .channelOpen(message)
+            case SSHMessage.ChannelOpenConfirmationMessage.id:
+                guard let message = self.readChannelOpenConfirmationMessage() else { return nil }
+                return .channelOpenConfirmation(message)
+            case SSHMessage.ChannelOpenFailureMessage.id:
+                guard let message = self.readChannelOpenFailureMessage() else { return nil }
+                return .channelOpenFailure(message)
+            case SSHMessage.ChannelWindowAdjustMessage.id:
+                guard let message = self.readChannelWindowAdjustMessage() else { return nil }
+                return .channelWindowAdjust(message)
+            case SSHMessage.ChannelDataMessage.id:
+                guard let message = self.readChannelDataMessage() else { return nil }
+                return .channelData(message)
+            case SSHMessage.ChannelExtendedDataMessage.id:
+                guard let message = self.readChannelExtendedDataMessage() else { return nil }
+                return .channelExtendedData(message)
+            case SSHMessage.ChannelEOFMessage.id:
+                guard let message = self.readChannelEOFMessage() else { return nil }
+                return .channelEOF(message)
+            case SSHMessage.ChannelCloseMessage.id:
+                guard let message = self.readChannelCloseMessage() else { return nil }
+                return .channelClose(message)
+            case SSHMessage.ChannelRequestMessage.id:
+                guard let message = try self.readChannelRequestMessage() else { return nil }
+                return .channelRequest(message)
+            case SSHMessage.ChannelSuccessMessage.id:
+                guard let message = self.readChannelSuccessMessage() else { return nil }
+                return .channelSuccess(message)
+            case SSHMessage.ChannelFailureMessage.id:
+                guard let message = self.readChannelFailureMessage() else { return nil }
                 return .channelFailure(message)
             default:
                 throw SSHMessage.ParsingError.unknownType(type)
@@ -714,6 +851,14 @@ extension ByteBuffer {
 
                     method = .publicKey(.unknown)
                 }
+            case "keyboard-interactive":
+                // keyboard-interactive request: language tag and submethods follow
+                guard let _ = self.readSSHStringAsString(),
+                      let _ = self.readSSHStringAsString()
+                else {
+                    return nil
+                }
+                method = .keyboardInteractive
             default:
                 return nil
             }
@@ -770,6 +915,48 @@ extension ByteBuffer {
             }
 
             return .init(key: publicKey)
+        }
+    }
+
+    mutating func readUserAuthInfoRequestMessage() throws -> SSHMessage.UserAuthInfoRequestMessage? {
+        try self.rewindOnNilOrError { `self` in
+            guard let name = self.readSSHStringAsString(),
+                  let instruction = self.readSSHStringAsString(),
+                  let languageTag = self.readSSHStringAsString(),
+                  let numPrompts = self.readInteger(as: UInt32.self)
+            else {
+                return nil
+            }
+
+            var prompts: [SSHMessage.UserAuthInfoRequestMessage.Prompt] = []
+            for _ in 0..<numPrompts {
+                guard let promptText = self.readSSHStringAsString(),
+                      let echo = self.readSSHBoolean()
+                else {
+                    return nil
+                }
+                prompts.append(.init(prompt: promptText, echo: echo))
+            }
+
+            return .init(name: name, instruction: instruction, languageTag: languageTag, prompts: prompts)
+        }
+    }
+
+    mutating func readUserAuthInfoResponseMessage() -> SSHMessage.UserAuthInfoResponseMessage? {
+        self.rewindReaderOnNil { `self` in
+            guard let numResponses = self.readInteger(as: UInt32.self) else {
+                return nil
+            }
+
+            var responses: [String] = []
+            for _ in 0..<numResponses {
+                guard let response = self.readSSHStringAsString() else {
+                    return nil
+                }
+                responses.append(response)
+            }
+
+            return .init(responses: responses)
         }
     }
 
@@ -1170,6 +1357,12 @@ extension ByteBuffer {
         case .userAuthPKOK(let message):
             writtenBytes += self.writeInteger(SSHMessage.UserAuthPKOKMessage.id)
             writtenBytes += self.writeUserAuthPKOKMessage(message)
+        case .userAuthInfoRequest(let message):
+            writtenBytes += self.writeInteger(SSHMessage.UserAuthInfoRequestMessage.id)
+            writtenBytes += self.writeUserAuthInfoRequestMessage(message)
+        case .userAuthInfoResponse(let message):
+            writtenBytes += self.writeInteger(SSHMessage.UserAuthInfoResponseMessage.id)
+            writtenBytes += self.writeUserAuthInfoResponseMessage(message)
         case .globalRequest(let message):
             writtenBytes += self.writeInteger(SSHMessage.GlobalRequestMessage.id)
             writtenBytes += self.writeGlobalRequestMessage(message)
@@ -1317,6 +1510,10 @@ extension ByteBuffer {
 
         case .publicKey(.unknown):
             preconditionFailure("We cannot write user auth request messages on unknown keys")
+        case .keyboardInteractive:
+            writtenBytes += self.writeSSHString("keyboard-interactive".utf8)
+            writtenBytes += self.writeSSHString("".utf8)  // language tag
+            writtenBytes += self.writeSSHString("".utf8)  // submethods
         }
 
         return writtenBytes
@@ -1341,6 +1538,28 @@ extension ByteBuffer {
         writtenBytes += self.writeSSHString(message.key.keyPrefix)
         writtenBytes += self.writeCompositeSSHString { buffer in
             buffer.writeSSHHostKey(message.key)
+        }
+        return writtenBytes
+    }
+
+    mutating func writeUserAuthInfoRequestMessage(_ message: SSHMessage.UserAuthInfoRequestMessage) -> Int {
+        var writtenBytes = 0
+        writtenBytes += self.writeSSHString(message.name.utf8)
+        writtenBytes += self.writeSSHString(message.instruction.utf8)
+        writtenBytes += self.writeSSHString(message.languageTag.utf8)
+        writtenBytes += self.writeInteger(UInt32(message.prompts.count))
+        for prompt in message.prompts {
+            writtenBytes += self.writeSSHString(prompt.prompt.utf8)
+            writtenBytes += self.writeSSHBoolean(prompt.echo)
+        }
+        return writtenBytes
+    }
+
+    mutating func writeUserAuthInfoResponseMessage(_ message: SSHMessage.UserAuthInfoResponseMessage) -> Int {
+        var writtenBytes = 0
+        writtenBytes += self.writeInteger(UInt32(message.responses.count))
+        for response in message.responses {
+            writtenBytes += self.writeSSHString(response.utf8)
         }
         return writtenBytes
     }
