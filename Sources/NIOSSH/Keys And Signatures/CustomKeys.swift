@@ -24,7 +24,14 @@ public protocol NIOSSHSignatureProtocol {
     /// An identifier that represents the type of signature used in an SSH packet.
     /// This identifier MUST be unique to the signature implementation.
     /// The returned value MUST NOT overlap with other signature implementations or a specifications that the signature does not implement.
+    /// This is the value written on the wire when serializing a signature produced by this type.
     static var signaturePrefix: String { get }
+
+    /// The complete set of signature-format identifiers that this type is willing to parse
+    /// from the wire. A type MAY accept several identifiers (for example an RSA signature
+    /// that writes "rsa-sha2-256" but still accepts legacy "ssh-rsa" signatures during
+    /// verification). Defaults to just `signaturePrefix`.
+    static var acceptedSignaturePrefixes: [String] { get }
 
     /// The raw reprentation of this signature as a blob.
     var rawRepresentation: Data { get }
@@ -35,6 +42,13 @@ public protocol NIOSSHSignatureProtocol {
 
     /// Reads this Signature from the buffer using the same format implemented in `write(to:)`
     static func read(from buffer: inout ByteBuffer) throws -> Self
+}
+
+public extension NIOSSHSignatureProtocol {
+    /// By default a signature type only accepts its own `signaturePrefix` on the wire.
+    static var acceptedSignaturePrefixes: [String] {
+        [Self.signaturePrefix]
+    }
 }
 
 internal extension NIOSSHSignatureProtocol {
@@ -48,6 +62,13 @@ public protocol NIOSSHPublicKeyProtocol {
     /// This identifier MUST be unique to the public key implementation.
     /// The returned value MUST NOT overlap with other public key implementations or a specifications that the public key does not implement.
     static var publicKeyPrefix: String { get }
+
+    /// The algorithm name advertised in the "public key algorithm name" field of an
+    /// SSH_MSG_USERAUTH_REQUEST and in the signable payload. For most key types this is
+    /// identical to `publicKeyPrefix`, but RFC 8332 allows a key whose blob format is
+    /// "ssh-rsa" to authenticate with a stronger signature algorithm such as
+    /// "rsa-sha2-256" or "rsa-sha2-512". Defaults to `publicKeyPrefix`.
+    static var publicKeyAuthAlgorithmName: String { get }
 
     /// The raw reprentation of this publc key as a blob.
     var rawRepresentation: Data { get }
@@ -63,9 +84,20 @@ public protocol NIOSSHPublicKeyProtocol {
     static func read(from buffer: inout ByteBuffer) throws -> Self
 }
 
+public extension NIOSSHPublicKeyProtocol {
+    /// Defaults the userauth algorithm name to the public key blob prefix.
+    static var publicKeyAuthAlgorithmName: String {
+        Self.publicKeyPrefix
+    }
+}
+
 internal extension NIOSSHPublicKeyProtocol {
     var publicKeyPrefix: String {
         Self.publicKeyPrefix
+    }
+
+    var publicKeyAuthAlgorithmName: String {
+        Self.publicKeyAuthAlgorithmName
     }
 }
 

@@ -199,12 +199,34 @@ extension NIOSSHPublicKey {
         }
     }
 
+    /// The algorithm name to advertise during public-key user authentication. This is the
+    /// same as `keyPrefix` for every bundled key type, but a custom key may override it to
+    /// authenticate using a stronger signature algorithm (RFC 8332), e.g. signing an
+    /// "ssh-rsa" key blob with "rsa-sha2-256".
+    var userAuthAlgorithmName: String.UTF8View {
+        switch self.backingKey {
+        case .ed25519, .ecdsaP256, .ecdsaP384, .ecdsaP521, .certified:
+            return self.keyPrefix
+        case .custom(let publicKey):
+            return publicKey.publicKeyAuthAlgorithmName.utf8
+        }
+    }
+
     private static let bundledAlgorithms: [String.UTF8View] = [
         Self.ed25519PublicKeyPrefix, Self.ecdsaP384PublicKeyPrefix, Self.ecdsaP256PublicKeyPrefix, Self.ecdsaP521PublicKeyPrefix,
     ]
 
     static var knownAlgorithms: [String.UTF8View] {
-        bundledAlgorithms + customPublicKeyAlgorithms.map { $0.publicKeyPrefix.utf8 }
+        var algorithms = bundledAlgorithms
+        for type in customPublicKeyAlgorithms {
+            algorithms.append(type.publicKeyPrefix.utf8)
+            // A custom key may authenticate under a different algorithm name than its blob
+            // prefix (RFC 8332), so accept that name too.
+            if type.publicKeyAuthAlgorithmName != type.publicKeyPrefix {
+                algorithms.append(type.publicKeyAuthAlgorithmName.utf8)
+            }
+        }
+        return algorithms
     }
 
     static var customPublicKeyAlgorithms: [NIOSSHPublicKeyProtocol.Type] {
