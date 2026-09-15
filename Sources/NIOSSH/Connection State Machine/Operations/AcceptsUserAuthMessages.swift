@@ -101,6 +101,18 @@ extension AcceptsUserAuthMessages {
         return .event(NIOUserAuthBannerEvent(message: message.message, languageTag: message.languageTag))
     }
 
+    mutating func receiveUserAuthInfoRequest(_ message: SSHMessage.UserAuthInfoRequestMessage) throws -> SSHConnectionStateMachine.StateMachineInboundProcessResult {
+        let result = try self.userAuthStateMachine.receiveUserAuthInfoRequest(message)
+
+        if let future = result {
+            return .possibleFutureMessage(future.map { response in
+                SSHMultiMessage(.userAuthInfoResponse(response))
+            })
+        } else {
+            return .noMessage
+        }
+    }
+
     private static func transform(_ result: NIOSSHUserAuthenticationResponseMessage, connectionAttributes: SSHConnectionStateMachine.Attributes?, username: String, banner: SSHServerConfiguration.UserAuthBanner? = nil) -> SSHMultiMessage {
         switch result {
         case .success:

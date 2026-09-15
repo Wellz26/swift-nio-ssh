@@ -301,7 +301,8 @@ struct SSHConnectionStateMachine {
 
         case .userAuthentication(var state):
             // In this state we tolerate receiving user auth messages.
-            guard let message = try state.parser.nextPacket() else {
+            let expectingKI = state.userAuthStateMachine.isExpectingKeyboardInteractive
+            guard let message = try state.parser.nextPacket(expectingKeyboardInteractive: expectingKI) else {
                 self.state = .userAuthentication(state)
                 return nil
             }
@@ -337,6 +338,16 @@ struct SSHConnectionStateMachine {
                 let result = try state.receiveUserAuthBanner(message)
                 self.state = .userAuthentication(state)
                 return result
+
+            case .userAuthInfoRequest(let message):
+                let result = try state.receiveUserAuthInfoRequest(message)
+                self.state = .userAuthentication(state)
+                return result
+
+            case .userAuthInfoResponse(let message):
+                // Clients don't typically receive these, but handle gracefully
+                self.state = .userAuthentication(state)
+                return .noMessage
 
             case .disconnect:
                 self.state = .receivedDisconnect(state.role)
@@ -853,6 +864,15 @@ struct SSHConnectionStateMachine {
 
             case .userAuthPKOK(let message):
                 try state.writeUserAuthPKOK(message, into: &buffer)
+                self.state = .userAuthentication(state)
+
+            case .userAuthInfoRequest(let message):
+                try state.writeUserAuthInfoRequest(message, into: &buffer)
+                self.state = .userAuthentication(state)
+
+            case .userAuthInfoResponse(let message):
+                try state.writeUserAuthInfoResponse(message, into: &buffer)
+                state.userAuthStateMachine.sentUserAuthInfoResponse()
                 self.state = .userAuthentication(state)
 
             case .disconnect:

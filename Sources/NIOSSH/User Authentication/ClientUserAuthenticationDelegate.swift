@@ -36,3 +36,35 @@ public protocol NIOSSHClientUserAuthenticationDelegate {
     ///     - nextChallengePromise: An `EventLoopPromise` to be fulfilled with the next authentication offer.
     func nextAuthenticationType(availableMethods: NIOSSHAvailableUserAuthenticationMethods, nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>)
 }
+
+/// A delegate that provides responses to keyboard-interactive authentication challenges.
+///
+/// When keyboard-interactive authentication is used, the server sends one or more prompts.
+/// This delegate is called to provide responses to those prompts.
+/// For simple password-based keyboard-interactive, the delegate can return a single password response.
+public protocol NIOSSHKeyboardInteractiveDelegate: AnyObject {
+    /// Called when the server sends keyboard-interactive prompts.
+    /// - Parameters:
+    ///   - name: The name of the prompt (descriptive text from the server)
+    ///   - instruction: Instructions from the server
+    ///   - prompts: The prompts to respond to
+    /// - Returns: An array of responses, one per prompt
+    func respondToKeyboardInteractiveChallenge(
+        name: String,
+        instruction: String,
+        prompts: [NIOSSHKeyboardInteractivePrompt]
+    ) -> [String]
+}
+
+/// A single keyboard-interactive prompt.
+public struct NIOSSHKeyboardInteractivePrompt {
+    /// The prompt text.
+    public var prompt: String
+    /// Whether the user's response should be echoed back.
+    public var echo: Bool
+
+    public init(prompt: String, echo: Bool) {
+        self.prompt = prompt
+        self.echo = echo
+    }
+}
