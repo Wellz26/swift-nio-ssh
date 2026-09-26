@@ -63,6 +63,18 @@ public protocol NIOSSHPublicKeyProtocol {
     static func read(from buffer: inout ByteBuffer) throws -> Self
 }
 
+/// A custom public key whose user authentication signatures use a different
+/// algorithm name from its key type.
+///
+/// For example, an RSA key has the key type `ssh-rsa`, but RFC 8332 signs user
+/// authentication with `rsa-sha2-256` or `rsa-sha2-512`. The algorithm name
+/// goes in the user authentication request and the signed payload, while the
+/// public key blob keeps the key type.
+public protocol NIOSSHUserAuthAlgorithmNaming {
+    /// The public key algorithm named in the user authentication request.
+    var userAuthAlgorithm: String { get }
+}
+
 internal extension NIOSSHPublicKeyProtocol {
     var publicKeyPrefix: String {
         Self.publicKeyPrefix
